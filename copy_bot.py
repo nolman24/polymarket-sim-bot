@@ -4,7 +4,7 @@ import time
 import threading
 from telegram.ext import Updater, CommandHandler
 
-TELEGRAM_TOKEN = "PUT_YOUR_TELEGRAM_TOKEN_HERE"
+TELEGRAM_TOKEN = "8597795591:AAE8vM_X8NJUOBwoqjmUtfgtWPFgMxCex1k"
 
 DATA_FILE = "positions.json"
 
