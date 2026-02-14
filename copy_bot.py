@@ -1,138 +1,150 @@
-import requests
-import json
+import os
 import time
-import threading
-from telegram.ext import Updater, CommandHandler
+import requests
+from telegram import Update, Bot
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-TELEGRAM_TOKEN = "8597795591:AAE8vM_X8NJUOBwoqjmUtfgtWPFgMxCex1k"
+# === CONFIGURATION ===
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # BotFather token
+COPY_PERCENT = int(os.environ.get("COPY_PERCENT", 10))  # % of trades to copy
+MODE = os.environ.get("MODE", "paper")  # "paper" or "live"
 
-DATA_FILE = "positions.json"
-
-tracked_wallet = None
-scale_mode = "percent"
-scale_value = 10
+# Store wallets and positions
+tracked_wallets = set()
+seen_trades = set()
 positions = {}
 
-### ---------------- LOAD/SAVE ----------------
+# Telegram bot setup
+bot = Bot(token=BOT_TOKEN)
+updater = Updater(bot=bot, use_context=True)
+dispatcher = updater.dispatcher
 
-def load_data():
-    global positions
+# === TELEGRAM COMMANDS ===
+
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Polymarket Copy Trader Bot Ready!\n"
+        "Commands:\n"
+        "/wallet WALLET_ADDRESS - start tracking a wallet\n"
+        "/percent VALUE - set copy percentage\n"
+        "/positions - view open positions\n"
+        "/stats - view P/L stats\n"
+        "/paper on/off - enable/disable paper mode"
+    )
+
+def add_wallet(update: Update, context: CallbackContext):
+    if len(context.args) != 1:
+        update.message.reply_text("Usage: /wallet WALLET_ADDRESS")
+        return
+    wallet = context.args[0]
+    tracked_wallets.add(wallet)
+    update.message.reply_text(f"Tracking wallet: {wallet}")
+
+def set_percent(update: Update, context: CallbackContext):
+    global COPY_PERCENT
+    if len(context.args) != 1:
+        update.message.reply_text("Usage: /percent VALUE")
+        return
     try:
-        with open(DATA_FILE, "r") as f:
-            positions = json.load(f)
-    except:
-        positions = {}
+        COPY_PERCENT = int(context.args[0])
+        update.message.reply_text(f"Copy percentage set to {COPY_PERCENT}%")
+    except ValueError:
+        update.message.reply_text("Please enter a valid number")
 
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(positions, f, indent=2)
-
-### ---------------- TELEGRAM COMMANDS ----------------
-
-def start(update, context):
-    update.message.reply_text("🤖 Polymarket Copy Trade Bot Ready!")
-
-def set_wallet(update, context):
-    global tracked_wallet
-    tracked_wallet = context.args[0]
-    update.message.reply_text(f"Tracking wallet: {tracked_wallet}")
-
-def set_percent(update, context):
-    global scale_mode, scale_value
-    scale_mode = "percent"
-    scale_value = float(context.args[0])
-    update.message.reply_text(f"Scaling set to {scale_value}%")
-
-def set_fixed(update, context):
-    global scale_mode, scale_value
-    scale_mode = "fixed"
-    scale_value = float(context.args[0])
-    update.message.reply_text(f"Fixed trade size set to ${scale_value}")
-
-def positions_cmd(update, context):
-    msg = "📊 OPEN POSITIONS\n\n"
-    for m in positions:
-        p = positions[m]
-        current = get_market_price(m)
-        pnl = (current - p["entry"]) * p["size"]
-        msg += f"{m}\nEntry: {p['entry']}\nCurrent: {current}\nSize: {p['size']}\nP/L: {round(pnl,2)}\n\n"
+def view_positions(update: Update, context: CallbackContext):
+    if not positions:
+        update.message.reply_text("No positions yet.")
+        return
+    msg = "Open Positions:\n"
+    for trade_id, pos in positions.items():
+        msg += f"{pos['market']} | Size: {pos['size']}$ | Entry: {pos['entry']}$ | Current: {pos['current']}$\n"
     update.message.reply_text(msg)
 
-def stats(update, context):
-    total = 0
-    wins = 0
-    losses = 0
-    for p in positions.values():
-        if "closed" in p:
-            total += p["profit"]
-            if p["profit"] > 0:
-                wins += 1
-            else:
-                losses += 1
-    update.message.reply_text(f"Total P/L: ${round(total,2)}\nWins: {wins}\nLosses: {losses}")
+def view_stats(update: Update, context: CallbackContext):
+    total_pnl = sum(pos['current'] - pos['entry'] for pos in positions.values())
+    update.message.reply_text(f"Total simulated P/L: ${total_pnl:.2f}")
 
-### ---------------- POLYMARKET ----------------
+def toggle_paper(update: Update, context: CallbackContext):
+    global MODE
+    if len(context.args) != 1:
+        update.message.reply_text("Usage: /paper on/off")
+        return
+    arg = context.args[0].lower()
+    if arg not in ["on", "off"]:
+        update.message.reply_text("Please use 'on' or 'off'")
+        return
+    MODE = "paper" if arg == "on" else "live"
+    update.message.reply_text(f"Paper trading mode: {MODE}")
 
-def get_trades(wallet):
-    url = f"https://data-api.polymarket.com/trades?maker={wallet}"
-    return requests.get(url).json()
+# Add command handlers
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("wallet", add_wallet))
+dispatcher.add_handler(CommandHandler("percent", set_percent))
+dispatcher.add_handler(CommandHandler("positions", view_positions))
+dispatcher.add_handler(CommandHandler("stats", view_stats))
+dispatcher.add_handler(CommandHandler("paper", toggle_paper))
 
-def get_market_price(market_id):
-    url = f"https://clob.polymarket.com/price/{market_id}"
-    r = requests.get(url).json()
-    return float(r["price"])
+# === POLYMARKET MONITORING ===
 
-### ---------------- COPY ENGINE ----------------
+def fetch_trades(wallet):
+    """
+    Fetch latest trades from Polymarket API for a given wallet.
+    Adjusted to use 'transactionHash' instead of 'id'.
+    """
+    url = f"https://api.polymarket.com/trades?wallet={wallet}&limit=10"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()  # Returns list of trades
+    except Exception as e:
+        print(f"Error fetching trades for {wallet}: {e}")
+        return []
 
-def copy_loop():
-    seen = set()
+def process_trades():
     while True:
-        try:
-            if tracked_wallet:
-                trades = get_trades(tracked_wallet)
-                for t in trades:
-                    tid = t["id"]
-                    if tid in seen:
-                        continue
-                    seen.add(tid)
+        for wallet in tracked_wallets:
+            trades = fetch_trades(wallet)
+            for trade in trades:
+                trade_id = trade.get("transactionHash")
+                if not trade_id or trade_id in seen_trades:
+                    continue  # Already processed
 
-                    market = t["market"]
-                    price = float(t["price"])
-                    size = float(t["size"])
+                seen_trades.add(trade_id)
+                market = trade.get("marketName", "Unknown Market")
+                size = trade.get("amount", 0) * (COPY_PERCENT / 100)
+                entry_price = trade.get("price", 0)
+                current_price = entry_price  # Initial, updated later
 
-                    if scale_mode == "percent":
-                        my_size = size * (scale_value / 100)
-                    else:
-                        my_size = scale_value
+                # Save position
+                positions[trade_id] = {
+                    "market": market,
+                    "size": size,
+                    "entry": entry_price,
+                    "current": current_price
+                }
 
-                    positions[market] = {
-                        "entry": price,
-                        "size": my_size
-                    }
+                # Notify user
+                msg = (
+                    f"New trade copied!\n"
+                    f"Market: {market}\n"
+                    f"Size: {size}$ ({COPY_PERCENT}% scale)\n"
+                    f"Entry price: {entry_price}$\n"
+                    f"Mode: {MODE}"
+                )
+                try:
+                    bot.send_message(chat_id=bot.get_me().id, text=msg)
+                except Exception as e:
+                    print(f"Error sending Telegram message: {e}")
 
-                    save_data()
-                    print(f"Copied trade on {market}")
+        time.sleep(15)  # Check every 15 seconds
 
-        except Exception as e:
-            print("Error:", e)
-
-        time.sleep(15)
-
-### ---------------- MAIN ----------------
-
-load_data()
-
-updater = Updater(TELEGRAM_TOKEN, use_context=True)
-dp = updater.dispatcher
-
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(CommandHandler("wallet", set_wallet))
-dp.add_handler(CommandHandler("percent", set_percent))
-dp.add_handler(CommandHandler("fixed", set_fixed))
-dp.add_handler(CommandHandler("positions", positions_cmd))
-dp.add_handler(CommandHandler("stats", stats))
-
-threading.Thread(target=copy_loop).start()
-
-updater.start_polling()
-updater.idle()
+# === START BOT ===
+if __name__ == "__main__":
+    import threading
+    # Run trade monitor in a separate thread
+    t = threading.Thread(target=process_trades)
+    t.daemon = True
+    t.start()
+    # Start Telegram bot
+    updater.start_polling()
+    updater.idle()
