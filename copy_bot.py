@@ -10,6 +10,7 @@ BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 POLYGON_RPC = os.environ.get("POLYGON_RPC")
 COPY_PERCENT = int(os.environ.get("COPY_PERCENT", 10))
 MODE = os.environ.get("MODE", "paper")  # "paper" or "live"
+HEROKU_URL = os.environ.get("HEROKU_URL")  # Your Railway app URL
 
 POLY_ABI = [
     {
@@ -152,17 +153,19 @@ def monitor_trades():
         last_block = current_block
         time.sleep(15)
 
-# === START BOT WITH WEBHOOK ===
+# === START BOT WITH WEBHOOK ON RAILWAY ===
 if __name__ == "__main__":
     t = threading.Thread(target=monitor_trades)
     t.daemon = True
     t.start()
 
     PORT = int(os.environ.get("PORT", 8443))
+    # Listen locally on 0.0.0.0, Telegram sees only public URL
     updater.start_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=BOT_TOKEN
     )
-    updater.bot.set_webhook(f"https://your-railway-app.up.railway.app/{BOT_TOKEN}")
+    # Webhook URL MUST be your Railway public app URL + bot token
+    updater.bot.set_webhook(f"{HEROKU_URL}/{BOT_TOKEN}")
     updater.idle()
