@@ -22,7 +22,7 @@ CHAT_ID = None
 def fetch_trades():
     try:
         url = f"https://data-api.polymarket.com/trades?user={COPY_WALLET}"
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=30)
         return res.json()
     except Exception as e:
         print("Trade fetch error:", e)
