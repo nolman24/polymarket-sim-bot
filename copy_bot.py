@@ -6,12 +6,11 @@ from telegram import Bot, Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
 # === CONFIGURATION ===
-BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")   # BotFather token
-POLYGON_RPC = os.environ.get("POLYGON_RPC")   # Polygon Mainnet RPC
-COPY_PERCENT = int(os.environ.get("COPY_PERCENT", 10))  # % of original trade
-MODE = os.environ.get("MODE", "paper")        # "paper" or "live"
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+POLYGON_RPC = os.environ.get("POLYGON_RPC")
+COPY_PERCENT = int(os.environ.get("COPY_PERCENT", 10))
+MODE = os.environ.get("MODE", "paper")  # "paper" or "live"
 
-# Minimal Polymarket Trade ABI
 POLY_ABI = [
     {
         "anonymous": False,
@@ -26,7 +25,6 @@ POLY_ABI = [
     }
 ]
 
-# === STATE ===
 tracked_wallets = set()
 tracked_contracts = {}  # wallet_address -> list of contracts
 seen_trades = set()
@@ -92,7 +90,6 @@ def toggle_paper(update: Update, context: CallbackContext):
     MODE = "paper" if arg == "on" else "live"
     update.message.reply_text(f"Paper trading mode: {MODE}")
 
-# Register command handlers
 dispatcher = updater.dispatcher
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("wallet", add_wallet))
@@ -103,10 +100,9 @@ dispatcher.add_handler(CommandHandler("paper", toggle_paper))
 
 # === CONTRACT DETECTION ===
 def detect_contracts_for_wallet(wallet):
-    """Detects contracts that emit Trade events for this wallet in recent blocks."""
     contracts = set()
     current_block = w3.eth.block_number
-    lookback = 5000  # last 5000 blocks (~1 day)
+    lookback = 5000
     for block in range(max(0, current_block - lookback), current_block + 1):
         block_data = w3.eth.get_block(block, full_transactions=True)
         for tx in block_data.transactions:
@@ -156,10 +152,17 @@ def monitor_trades():
         last_block = current_block
         time.sleep(15)
 
-# === START BOT ===
+# === START BOT WITH WEBHOOK ===
 if __name__ == "__main__":
     t = threading.Thread(target=monitor_trades)
     t.daemon = True
     t.start()
-    updater.start_polling()
+
+    PORT = int(os.environ.get("PORT", 8443))
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN
+    )
+    updater.bot.set_webhook(f"https://your-railway-app.up.railway.app/{BOT_TOKEN}")
     updater.idle()
