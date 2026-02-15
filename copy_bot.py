@@ -4,9 +4,9 @@ import threading
 import requests
 from telegram.ext import Updater, CommandHandler
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ================= CONFIG =================
 
-# ================= SETTINGS =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Only variable needed in Railway
 
 COPY_WALLET = "0x1d0034134e339a309700ff2d34e99fa2d48b0313"
 
@@ -14,10 +14,10 @@ COPY_MODE = "percent"  # "percent" or "fixed"
 COPY_PERCENT = 10
 FIXED_AMOUNT = 5
 
-positions = {}  # market_id -> position data
+positions = {}  # market_slug -> position data
+CHAT_ID = None
 
-# ============================================
-
+# ==========================================
 
 def fetch_trades():
     try:
@@ -27,7 +27,6 @@ def fetch_trades():
     except Exception as e:
         print("Trade fetch error:", e)
         return []
-
 
 def simulate_trade(trade):
     global positions
@@ -56,7 +55,6 @@ def simulate_trade(trade):
     pos["avg_price"] = total_cost / pos["size"]
     pos["side"] = side
 
-
 def trade_monitor(bot):
     seen = set()
 
@@ -64,33 +62,45 @@ def trade_monitor(bot):
         trades = fetch_trades()
 
         for t in trades:
-            trade_id = t["id"]
+            # Use market + timestamp as unique ID
+            trade_id = f"{t.get('market_slug','')}|{t.get('timestamp','')}"
             if trade_id in seen:
                 continue
 
             seen.add(trade_id)
 
-            simulate_trade(t)
+            # Safely extract fields
+            try:
+                market = t.get("market_slug", "unknown-market")
+                price = float(t.get("price", 0))
+                size = float(t.get("size", 0))
+                side = t.get("side", "YES")
+            except Exception as e:
+                print("Skipping trade due to missing field:", e)
+                continue
+
+            simulate_trade({
+                "market_slug": market,
+                "price": price,
+                "size": size,
+                "side": side
+            })
 
             msg = (
                 "📈 Copied Trade\n\n"
-                f"Market: {t['market_slug']}\n"
-                f"Side: {t['side']}\n"
-                f"Trader Size: ${t['size']}\n"
-                f"Your Size: ${round((float(t['size']) * COPY_PERCENT/100),2)}\n"
-                f"Price: {t['price']}"
+                f"Market: {market}\n"
+                f"Side: {side}\n"
+                f"Trader Size: ${size}\n"
+                f"Your Size: ${round((size * COPY_PERCENT/100),2)}\n"
+                f"Price: {price}"
             )
 
-            bot.send_message(chat_id=CHAT_ID, text=msg)
+            if CHAT_ID:
+                bot.send_message(chat_id=CHAT_ID, text=msg)
 
         time.sleep(5)
 
-
 # ================= TELEGRAM COMMANDS =================
-
-
-CHAT_ID = None
-
 
 def start(update, context):
     global CHAT_ID
@@ -99,11 +109,10 @@ def start(update, context):
         "🤖 Polymarket Copy Bot (Paper Mode)\n\n"
         "Default: Copying at 10% scale.\n\n"
         "Commands:\n"
-        "/positions\n"
-        "/mode percent 10\n"
-        "/mode fixed 5"
+        "/positions - Show current positions\n"
+        "/mode percent 10 - Set percent copy size\n"
+        "/mode fixed 5 - Set fixed copy size"
     )
-
 
 def positions_cmd(update, context):
     if not positions:
@@ -122,7 +131,6 @@ def positions_cmd(update, context):
 
     update.message.reply_text(msg)
 
-
 def mode_cmd(update, context):
     global COPY_MODE, COPY_PERCENT, FIXED_AMOUNT
 
@@ -134,18 +142,17 @@ def mode_cmd(update, context):
             COPY_MODE = "percent"
             COPY_PERCENT = value
             update.message.reply_text(f"✅ Copy mode set to {value}%")
-
         elif mode == "fixed":
             COPY_MODE = "fixed"
             FIXED_AMOUNT = value
             update.message.reply_text(f"✅ Fixed copy set to ${value}")
+        else:
+            update.message.reply_text("Usage:\n/mode percent 10\n/mode fixed 5")
 
     except:
         update.message.reply_text("Usage:\n/mode percent 10\n/mode fixed 5")
 
-
 # ================= MAIN =================
-
 
 def main():
     updater = Updater(BOT_TOKEN, use_context=True)
@@ -162,7 +169,6 @@ def main():
     threading.Thread(target=trade_monitor, args=(updater.bot,), daemon=True).start()
 
     updater.idle()
-
 
 if __name__ == "__main__":
     main()
