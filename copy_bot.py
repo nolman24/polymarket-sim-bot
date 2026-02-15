@@ -1,221 +1,195 @@
 import os
 import time
 import threading
-import queue
 import requests
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler, CallbackContext, Update
+from collections import defaultdict
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Telegram bot token
-COPY_WALLET = ""  # Wallet to copy trades from
-TRADE_SCALE = 0.1  # 10% of original trade by default
-TRADE_FETCH_INTERVAL = 1  # seconds
-NOTIFICATION_INTERVAL = 1  # seconds for batched notifications
-POLYM_API = "https://data-api.polymarket.com"
-# ----------------------------------------
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-bot = Bot(token=BOT_TOKEN)
+# ================= CONFIG =================
 
-# ---------------- STORAGE ----------------
-trade_queue = queue.Queue()        # Queue for new trades
-open_trades = {}                   # Active trades
-closed_trades = []                 # Resolved trades
-seen_trades = set()                # Already processed trades
-wallet_address = COPY_WALLET
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+COPY_WALLET = os.getenv("COPY_WALLET", "")
+TRADE_SCALE = float(os.getenv("TRADE_SCALE", 0.1))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", 1))
+POLYM_API = os.getenv("POLYM_API", "https://data-api.polymarket.com")
 
-# ---------------- TELEGRAM COMMANDS ----------------
+# ================= STORAGE =================
+
+seen_trades = set()
+
+positions = defaultdict(lambda: {
+    "size": 0,
+    "avg_price": 0,
+    "side": "",
+    "realized_pnl": 0
+})
+
+trade_history = []
+
+# ================= HELPERS =================
+
+def safe_get(d, key, default=None):
+    return d[key] if key in d else default
+
+# ================= TRADE MONITOR =================
+
+def trade_monitor(bot):
+    print("High-frequency trade monitor started...")
+
+    while True:
+        try:
+            if not COPY_WALLET:
+                time.sleep(5)
+                continue
+
+            url = f"{POLYM_API}/trades?wallet={COPY_WALLET}&limit=50"
+            r = requests.get(url, timeout=10)
+            trades = r.json()
+
+            for t in trades:
+
+                trade_id = safe_get(t, "id")
+                if not trade_id:
+                    continue
+
+                if trade_id in seen_trades:
+                    continue
+
+                seen_trades.add(trade_id)
+
+                market = safe_get(t, "marketSlug", "unknown-market")
+                side = safe_get(t, "side", "BUY")
+                price = float(safe_get(t, "price", 0))
+                size = float(safe_get(t, "size", 0))
+
+                if price == 0 or size == 0:
+                    continue
+
+                my_size = size * TRADE_SCALE
+
+                pos = positions[market]
+
+                # ================= OPEN / CLOSE LOGIC =================
+
+                if pos["size"] == 0:
+                    pos["size"] = my_size
+                    pos["avg_price"] = price
+                    pos["side"] = side
+
+                elif pos["side"] == side:
+                    # averaging in
+                    total_value = pos["avg_price"] * pos["size"] + price * my_size
+                    pos["size"] += my_size
+                    pos["avg_price"] = total_value / pos["size"]
+
+                else:
+                    # closing trade
+                    pnl = (price - pos["avg_price"]) * pos["size"]
+                    if pos["side"] == "SELL":
+                        pnl *= -1
+
+                    pos["realized_pnl"] += pnl
+
+                    trade_history.append({
+                        "market": market,
+                        "pnl": pnl
+                    })
+
+                    pos["size"] = 0
+
+                # ================= SEND TELEGRAM ALERT =================
+
+                bot.send_message(
+                    chat_id=list(user_chats)[0],
+                    text=(
+                        f"📈 Copied Trade\n\n"
+                        f"Market: {market}\n"
+                        f"Side: {side}\n"
+                        f"Trader Size: ${round(size,2)}\n"
+                        f"Your Size: ${round(my_size,2)}\n"
+                        f"Price: {price}"
+                    )
+                )
+
+        except Exception as e:
+            print("Trade fetch error:", e)
+
+        time.sleep(POLL_INTERVAL)
+
+# ================= TELEGRAM COMMANDS =================
+
+user_chats = set()
+
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "🚀 Copy-Trade Bot Active!\nUse /wallet <address> to start copying trades."
-    )
+    user_chats.add(update.effective_chat.id)
+    update.message.reply_text("🤖 Copy Trading Bot Ready")
 
-def positions(update: Update, context: CallbackContext):
-    if not open_trades:
-        update.message.reply_text("📊 No Open Positions Yet")
-        return
-    msg = "📊 Active Positions:\n\n"
-    for t in open_trades.values():
-        pl_text = f"${t.get('current_pl', 0):.2f}" if 'current_pl' in t else "Pending"
-        msg += (
-            f"Market: {t['market_name']}\n"
-            f"Side: {t['side']}\n"
-            f"Size: ${t['your_size']:.2f}\n"
-            f"Entry Price: {t['price']:.2f}\n"
-            f"Current P/L: {pl_text}\n\n"
-        )
-    update.message.reply_text(msg.strip())
-
-def history(update: Update, context: CallbackContext):
-    if not closed_trades:
-        update.message.reply_text("📜 No Resolved Trades Yet")
-        return
-    msg = "📜 Trade History (Last 20):\n\n"
-    for t in closed_trades[-20:]:
-        pl_sign = "✅" if t['pl'] >= 0 else "❌"
-        msg += (
-            f"Market: {t['market_name']}\n"
-            f"Side: {t['side']}\n"
-            f"Size: ${t['your_size']:.2f}\n"
-            f"Entry Price: {t['price']:.2f}\n"
-            f"Exit Price: {t['exit_price']:.2f}\n"
-            f"P/L: ${t['pl']:.2f} {pl_sign}\n\n"
-        )
-    update.message.reply_text(msg.strip())
+def wallet(update: Update, context: CallbackContext):
+    global COPY_WALLET
+    COPY_WALLET = context.args[0]
+    update.message.reply_text(f"Now copying wallet:\n{COPY_WALLET}")
 
 def mode(update: Update, context: CallbackContext):
     global TRADE_SCALE
-    try:
-        arg = context.args[0]
-        if arg.endswith('%'):
-            percent = float(arg[:-1])
-            TRADE_SCALE = percent / 100
-            update.message.reply_text(f"✅ Trade scale set to {percent}% of copied wallet trades.")
-        else:
-            fixed = float(arg)
-            TRADE_SCALE = fixed
-            update.message.reply_text(f"✅ Trade scale set to fixed ${fixed} per trade.")
-    except Exception:
-        update.message.reply_text("Usage: /mode 10%  or /mode 5")
+    val = context.args[0].replace("%", "")
+    TRADE_SCALE = float(val) / 100
+    update.message.reply_text(f"Trade scale set to {val}%")
 
-def wallet(update: Update, context: CallbackContext):
-    global wallet_address
-    if context.args:
-        wallet_address = context.args[0]
-        update.message.reply_text(f"✅ Now copying wallet: {wallet_address}")
-    else:
-        update.message.reply_text("Usage: /wallet <wallet_address>")
+def positions_cmd(update: Update, context: CallbackContext):
+    msg = "📊 Your Positions:\n\n"
 
-# ---------------- TRADE FUNCTIONS ----------------
-def fetch_trades():
-    if not wallet_address:
-        return []
-    try:
-        url = f"{POLYM_API}/trades?wallet={wallet_address}&limit=20"
-        res = requests.get(url, timeout=10)
-        res.raise_for_status()
-        return res.json().get("trades", [])
-    except Exception as e:
-        print("Trade fetch error:", e)
-        return []
+    for market, pos in positions.items():
+        if pos["size"] > 0:
+            msg += (
+                f"{market}\n"
+                f"Side: {pos['side']}\n"
+                f"Size: ${round(pos['size'],2)}\n"
+                f"Avg Price: {round(pos['avg_price'],2)}\n\n"
+            )
 
-def fetch_market_result(market_id):
-    try:
-        url = f"{POLYM_API}/markets/{market_id}"
-        res = requests.get(url, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        if data.get("resolved"):
-            return data.get("winning_side"), data.get("payout_per_dollar", 1)
-        return None, None
-    except Exception as e:
-        print("Market fetch error:", e)
-        return None, None
+    if msg == "📊 Your Positions:\n\n":
+        msg += "No open positions."
 
-# ---------------- MONITOR THREADS ----------------
-def trade_fetcher():
-    while True:
-        trades = fetch_trades()
-        for t in trades:
-            trade_id = t.get("id")
-            if not trade_id or trade_id in seen_trades:
-                continue
-            seen_trades.add(trade_id)
-            trade_queue.put(t)
-        time.sleep(TRADE_FETCH_INTERVAL)
+    update.message.reply_text(msg)
 
-def trade_processor():
-    notifications = []
-    last_notify = time.time()
-    while True:
-        try:
-            t = trade_queue.get(timeout=NOTIFICATION_INTERVAL)
-        except:
-            t = None
+def history(update: Update, context: CallbackContext):
+    if not trade_history:
+        update.message.reply_text("No closed trades yet.")
+        return
 
-        if t:
-            trader_size = t.get("size_usd", 0)
-            your_size = trader_size * TRADE_SCALE if TRADE_SCALE <= 1 else TRADE_SCALE
-            trade_info = {
-                "trade_id": t["id"],
-                "market_id": t.get("market_id"),
-                "market_name": t.get("market_name", "unknown-market"),
-                "side": t.get("side", "BUY"),
-                "price": t.get("price", 0),
-                "your_size": your_size,
-                "resolved": False,
-                "exit_price": None,
-                "pl": None
-            }
-            open_trades[t["id"]] = trade_info
-            notifications.append(trade_info)
+    total = 0
+    msg = "📜 Trade History:\n\n"
 
-        # Batch notifications every NOTIFICATION_INTERVAL
-        if time.time() - last_notify >= NOTIFICATION_INTERVAL and notifications:
-            msg = f"📈 Copied {len(notifications)} trades\n"
-            for n in notifications:
-                msg += (
-                    f"Market: {n['market_name']}, "
-                    f"Side: {n['side']}, "
-                    f"Your Size: ${n['your_size']:.2f}\n"
-                )
-            try:
-                bot.send_message(chat_id=bot.get_me().id, text=msg.strip())
-            except Exception as e:
-                print("Telegram send error:", e)
-            notifications.clear()
-            last_notify = time.time()
+    for t in trade_history[-10:]:
+        msg += f"{t['market']} → P/L: ${round(t['pnl'],2)}\n"
+        total += t["pnl"]
 
-def trade_resolver():
-    while True:
-        for t_id, t_info in list(open_trades.items()):
-            winning_side, payout = fetch_market_result(t_info['market_id'])
-            if winning_side:
-                if t_info['side'] == winning_side:
-                    pl = (payout - t_info['price']) * t_info['your_size']
-                else:
-                    pl = (1 - t_info['price']) * t_info['your_size'] * -1
+    msg += f"\nTotal Realized P/L: ${round(total,2)}"
 
-                t_info['exit_price'] = payout
-                t_info['pl'] = pl
-                t_info['resolved'] = True
+    update.message.reply_text(msg)
 
-                closed_trades.append(t_info)
-                del open_trades[t_id]
+# ================= MAIN =================
 
-                # Telegram notification
-                try:
-                    bot.send_message(
-                        chat_id=bot.get_me().id,
-                        text=(
-                            f"📌 Trade Resolved!\n"
-                            f"Market: {t_info['market_name']}\n"
-                            f"Side: {t_info['side']}\n"
-                            f"Size: ${t_info['your_size']:.2f}\n"
-                            f"P/L: ${pl:.2f} {'✅' if pl >= 0 else '❌'}"
-                        )
-                    )
-                except Exception as e:
-                    print("Telegram send error:", e)
-        time.sleep(1)
-
-# ---------------- MAIN ----------------
 def main():
-    updater = Updater(token=BOT_TOKEN, use_context=True)
+    updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("positions", positions))
-    dp.add_handler(CommandHandler("history", history))
-    dp.add_handler(CommandHandler("mode", mode))
     dp.add_handler(CommandHandler("wallet", wallet))
-
-    threading.Thread(target=trade_fetcher, daemon=True).start()
-    threading.Thread(target=trade_processor, daemon=True).start()
-    threading.Thread(target=trade_resolver, daemon=True).start()
+    dp.add_handler(CommandHandler("mode", mode))
+    dp.add_handler(CommandHandler("positions", positions_cmd))
+    dp.add_handler(CommandHandler("history", history))
 
     updater.start_polling()
-    print("High-frequency trade monitor started...")
+
+    threading.Thread(
+        target=trade_monitor,
+        args=(updater.bot,),
+        daemon=True
+    ).start()
+
     updater.idle()
 
 if __name__ == "__main__":
